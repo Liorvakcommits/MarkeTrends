@@ -1,0 +1,17 @@
+{
+    "name": "MarkeTrends Coin",
+    "symbol": "MTC",
+    "description": "Official MarkeTrends cryptocurrency token for prediction markets and decentralized finance.",
+    "image": "https://gateway.pinata.cloud/ipfs/bafkreigvzntdxazuivgc5rj376omfk6ahvxrfgbe6623x22elqz545c4ju",
+    "decimals": 18,
+    "contractAddress": "0x298a358D85cD985b1677fD7813418a670cF2a1c2",
+    "properties": {
+      "category": "ERC-1155",
+      "use_case": "Prediction Markets",
+      "network": "Polygon Mainnet",
+      "issuer": "MarkeTrends"
+    },
+    "tags": ["DeFi", "Prediction Market", "Cryptocurrency", "ERC-1155"]
+  }
+  
+  
