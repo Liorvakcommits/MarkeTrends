@@ -1,0 +1,40 @@
+# Node.js dependencies
+node_modules/
+.env
+
+# Hardhat files
+/cache
+/artifacts
+
+# TypeChain files
+/typechain
+/typechain-types
+
+# Solidity coverage files
+/coverage
+/coverage.json
+
+# Hardhat Ignition default folder for deployments against a local node
+ignition/deployments/chain-31337
+
+# Ignore logs and debug files
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+*.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# VS Code settings (אם אתה עובד עם VS Code)
+/.vscode
+
+node_modules/
+.env
+cache/
+artifacts/
+typechain/
+typechain-types/
+coverage/
+ignition/deployments/chain-31337
