@@ -25,12 +25,11 @@ contract MarketManager is ERC1155, Ownable {
     event RewardsClaimed(address indexed user, uint256 indexed marketId, uint256 payout);
     event FundsWithdrawn(address indexed owner, uint256 amount);
 
-  constructor(address initialOwner) 
-    ERC1155("https://gateway.pinata.cloud/ipfs/bafkreigvzntdxazuivgc5rj376omfk6ahvxrfgbe6623x22elqz545c4ju/{id}.json") 
-    Ownable(initialOwner) {
-    emit ContractDeployed(initialOwner);
-}
-
+    constructor(address initialOwner) 
+        ERC1155("https://gateway.pinata.cloud/ipfs/bafkreigvzntdxazuivgc5rj376omfk6ahvxrfgbe6623x22elqz545c4ju/{id}.json") 
+        Ownable(initialOwner) {
+        emit ContractDeployed(initialOwner);
+    }
 
     /**
      * @dev פונקציה לקבלת MATIC ישירות לחוזה
@@ -42,21 +41,26 @@ contract MarketManager is ERC1155, Ownable {
     /**
      * @dev יצירת שוק חדש להימור
      */
-    function createMarket(string memory marketName, uint256 initialSupply, uint256 pricePerToken, uint256 expirationTimestamp) public onlyOwner {
-        require(bytes(marketName).length > 0, "Market name cannot be empty");
-        require(initialSupply > 0, "Initial supply must be greater than 0");
-        require(pricePerToken > 0, "Price per token must be greater than 0");
-        require(expirationTimestamp > block.timestamp, "Expiration date must be in the future");
+ function createMarket(string memory marketName, uint256 initialSupply, uint256 pricePerToken, uint256 expirationTimestamp) public onlyOwner {
+    require(bytes(marketName).length > 0, "Market name cannot be empty");
+    require(initialSupply > 0, "Initial supply must be greater than 0");
+    require(pricePerToken > 0, "Price per token must be greater than 0");
+    require(expirationTimestamp > block.timestamp, "Expiration date must be in the future");
 
-        marketNames[nextMarketId] = marketName;
-        tokenPrices[nextMarketId] = pricePerToken;
-        expirationTimestamps[nextMarketId] = expirationTimestamp;
-        
-        _mint(owner(), nextMarketId, initialSupply, "");
+    marketNames[nextMarketId] = marketName;
+    tokenPrices[nextMarketId] = pricePerToken;
+    expirationTimestamps[nextMarketId] = expirationTimestamp;
 
-        emit MarketCreated(nextMarketId, marketName, initialSupply, pricePerToken, expirationTimestamp);
-        nextMarketId++;
-    }
+    _mint(owner(), nextMarketId, initialSupply, "");
+
+    emit MarketCreated(nextMarketId, marketName, initialSupply, pricePerToken, expirationTimestamp);
+
+    uint256 ownerTokenBalance = balanceOf(owner(), nextMarketId);
+    require(ownerTokenBalance == initialSupply, "Token minting failed!");
+
+    nextMarketId++;
+}
+
 
     /**
      * @dev מחזירה את מספר השוק הבא
@@ -88,16 +92,24 @@ contract MarketManager is ERC1155, Ownable {
     /**
      * @dev רכישת טוקן של הימור מסוים
      */
-    function buyTokens(uint256 marketId, uint256 amount) public payable {
-        require(balanceOf(owner(), marketId) >= amount, "Not enough tokens available");
-        require(msg.value == tokenPrices[marketId] * amount, "Incorrect payment amount");
-        require(!marketResolved[marketId], "Market is already resolved");
+   uint256 public houseFeePercentage = 5; // 5% מהכסף נשאר בחוזה למימון הזוכים
 
-        _safeTransferFrom(owner(), msg.sender, marketId, amount, "");
-        contractBalance += msg.value; // שומר את ה-MATIC בחוזה
+function buyTokens(uint256 marketId, uint256 amount) public payable {
+    require(balanceOf(owner(), marketId) >= amount, "Not enough tokens available");
+    require(msg.value == tokenPrices[marketId] * amount, "Incorrect payment amount");
+    require(!marketResolved[marketId], "Market is already resolved");
 
-        emit TokensPurchased(msg.sender, marketId, amount, msg.value, contractBalance);
-    }
+    _safeTransferFrom(owner(), msg.sender, marketId, amount, "");
+
+    uint256 fee = (msg.value * houseFeePercentage) / 100;
+    contractBalance += (msg.value - fee); // רק 95% הולך לקופה שמשתמשים יכולים למשוך
+    (bool success, ) = payable(owner()).call{value: fee}(""); // 5% הולך למערכת
+    require(success, "House fee transfer failed");
+
+    emit TokensPurchased(msg.sender, marketId, amount, msg.value, contractBalance);
+}
+
+
 
     /**
      * @dev מכירת טוקן של הימור חזרה לשוק
@@ -134,28 +146,34 @@ contract MarketManager is ERC1155, Ownable {
     /**
      * @dev משיכת רווחים לאחר סגירת השוק
      */
-    function claimRewards(uint256 marketId) public {
-        require(marketResolved[marketId], "Market is not resolved yet");
+   function claimRewards(uint256 marketId) public {
+    require(marketResolved[marketId], "Market is not resolved yet");
 
-        uint256 userBalance = balanceOf(msg.sender, marketId);
-        require(userBalance > 0, "No tokens to claim");
+    uint256 userBalance = balanceOf(msg.sender, marketId);
+    require(userBalance > 0, "No tokens to claim");
 
-        uint256 totalPayout = tokenPrices[marketId] * userBalance;
-        uint256 platformFee = (totalPayout * 2) / 100; // 2% עמלה
-        uint256 finalPayout = totalPayout - platformFee;
+    uint256 totalPayout = tokenPrices[marketId] * userBalance;
+    uint256 platformFee = (totalPayout * 2) / 100;
+    uint256 finalPayout = totalPayout - platformFee;
 
-        require(contractBalance >= finalPayout, "Not enough funds in contract");
-        _burn(msg.sender, marketId, userBalance); // מוחק את הטוקנים של המשתמש לאחר קבלת הרווחים
-        contractBalance -= totalPayout; // מעדכן את יתרת החוזה לאחר התשלום
+    require(address(this).balance >= finalPayout, "Not enough funds in contract");
 
-        (bool success, ) = payable(msg.sender).call{value: finalPayout}("");
-        require(success, "Failed to transfer rewards");
+    _burn(msg.sender, marketId, userBalance);
 
-        (bool platformSuccess, ) = payable(owner()).call{value: platformFee}("");
-        require(platformSuccess, "Platform fee transfer failed");
+    contractBalance -= totalPayout;
 
-        emit RewardsClaimed(msg.sender, marketId, finalPayout);
-    }
+    (bool success, ) = payable(msg.sender).call{value: finalPayout}("");
+    require(success, "Failed to transfer rewards");
+
+    (bool platformSuccess, ) = payable(owner()).call{value: platformFee}("");
+    require(platformSuccess, "Platform fee transfer failed");
+    
+
+
+
+    emit RewardsClaimed(msg.sender, marketId, finalPayout);
+}
+
 
     /**
      * @dev מאפשר לבעלים למשוך את כל הכספים מהחוזה
@@ -174,11 +192,11 @@ contract MarketManager is ERC1155, Ownable {
     /**
      * @dev קבלת יתרת החוזה
      */
-   function getContractBalance() public view returns (uint256) {
-    return address(this).balance; // מציג את היתרה האמיתית של החוזה
+    function getContractBalance() public view returns (uint256) {
+        return address(this).balance; // מציג את היתרה האמיתית של החוזה
+    }
 }
 
-}
 
 
 
