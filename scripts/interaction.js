@@ -1,86 +1,80 @@
-// scripts/interaction.js
 const { ethers } = require("hardhat");
-const fs = require("fs");
+const fs = require('fs');
+const path = require('path');
 
 async function main() {
-    const contractAddress = fs.readFileSync("./deployed_address.txt", "utf8").trim();
-    const [deployer] = await ethers.getSigners();
-    console.log("Deployer address:", deployer.address);
+  const [deployer] = await ethers.getSigners();
 
-    const marketManager = await ethers.getContractAt("MarketManager", contractAddress);
-    console.log("Connected to MarketManager at:", contractAddress);
+  console.log("Interacting with contracts using the account:", deployer.address);
 
-    const owner = await marketManager.owner();
-    console.log("Contract owner:", owner);
+  // Load deployment addresses
+  const deploymentPath = path.join(__dirname, '..', 'deployment-addresses.json');
+  const deploymentAddresses = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
 
-    const nextMarketId = await marketManager.getNextMarketId();
-    console.log("Next Market ID:", nextMarketId.toString());
+  // Connect to deployed contracts
+  const MarketManager = await ethers.getContractFactory("MarketManager");
+  const marketManager = await MarketManager.attach(deploymentAddresses.MarketManager);
 
-    console.log("Creating new market...");
-    let expirationTimestamp = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60);
-    let tx = await marketManager.createMarket("Football Predictions", 1000, ethers.parseEther("0.1"), expirationTimestamp);
-    await tx.wait();
-    console.log("New market created!");
+  const MarketManagerHelper = await ethers.getContractFactory("MarketManagerHelper");
+  const marketManagerHelper = await MarketManagerHelper.attach(deploymentAddresses.MarketManagerHelper);
 
-    const price = await marketManager.tokenPrices(1);
-    console.log("Token price for Market ID 1:", ethers.formatEther(price), "MATIC");
+  const ConditionalTokens = await ethers.getContractFactory("ConditionalTokens");
+  const conditionalTokens = await ConditionalTokens.attach(deploymentAddresses.ConditionalTokens);
 
-    console.log("Checking if market is resolved before buying...");
-    const isResolvedBeforeBuy = await marketManager.isMarketResolved(1);
+  // Interact with MarketManager
+  console.log("Creating a new market...");
+  const marketName = "Test Market";
+  const pricePerToken = ethers.utils.parseEther("0.1");
+  const expirationTimestamp = Math.floor(Date.now() / 1000) + 86400; // 24 hours from now
 
-    if (!isResolvedBeforeBuy) {
-        console.log("Buying 10 tokens...");
-        tx = await marketManager.buyTokens(1, 10, { value: ethers.parseEther("1") });
-        await tx.wait();
-        console.log("Successfully purchased 10 tokens!");
-    } else {
-        console.log("Market is already resolved. Skipping buyTokens().");
-    }
+  try {
+    const tx = await marketManager.createMarket(marketName, pricePerToken, expirationTimestamp);
+    const receipt = await tx.wait();
+    console.log("Market created. Transaction hash:", receipt.transactionHash);
 
-    const balance = await marketManager.balanceOf(deployer.address, 1);
-    console.log("Your token balance for Market ID 1:", balance.toString());
+    // Get market details
+    const marketId = 1; // Assuming this is the first market
+    const marketDetails = await marketManager.getMarketDetails(marketId);
+    console.log("Market Details:", marketDetails);
 
-    const contractBalance = await marketManager.getContractBalance();
-    console.log("Contract balance:", ethers.formatEther(contractBalance), "MATIC");
+    // Buy tokens
+    console.log("Buying tokens...");
+    const buyAmount = ethers.utils.parseEther("1");
+    const buyTx = await marketManager.buyTokens(marketId, buyAmount, true);
+    const buyReceipt = await buyTx.wait();
+    console.log("Tokens bought. Transaction hash:", buyReceipt.transactionHash);
 
-    console.log("Selling 5 tokens...");
-    tx = await marketManager.sellTokens(1, 5);
-    await tx.wait();
-    console.log("Successfully sold 5 tokens!");
+    // Get market statistics
+    const marketStats = await marketManagerHelper.getMarketStatistics(marketId);
+    console.log("Market Statistics:", marketStats);
 
-    console.log("Checking if market is resolved...");
-    const isResolved = await marketManager.isMarketResolved(1);
-    console.log("Market resolved status:", isResolved);
+    // Get user trading stats
+    const userStats = await marketManagerHelper.getUserTradingStats(deployer.address, marketId);
+    console.log("User Trading Stats:", userStats);
 
-    if (!isResolved) {
-        console.log("Resolving market...");
-        tx = await marketManager.resolveMarket(1, true);
-        await tx.wait();
-        console.log("Market resolved as YES!");
-    }
+    // Resolve market (only owner can do this)
+    console.log("Resolving market...");
+    const resolveTx = await marketManager.resolveMarket(marketId, true);
+    const resolveReceipt = await resolveTx.wait();
+    console.log("Market resolved. Transaction hash:", resolveReceipt.transactionHash);
 
-    console.log("Fetching market details...");
-    const marketDetails = await marketManager.getMarketDetails(1);
-    console.log("Market details:", marketDetails);
-
+    // Claim rewards
     console.log("Claiming rewards...");
-    tx = await marketManager.claimRewards(1);
-    await tx.wait();
-    console.log("Rewards claimed successfully!");
+    const claimTx = await marketManager.claimRewards(marketId);
+    const claimReceipt = await claimTx.wait();
+    console.log("Rewards claimed. Transaction hash:", claimReceipt.transactionHash);
 
-    console.log("Withdrawing contract funds...");
-    tx = await marketManager.withdrawFunds();
-    await tx.wait();
-    console.log("Funds withdrawn successfully!");
+  } catch (error) {
+    console.error("Error interacting with contracts:", error);
+  }
 }
 
 main()
-    .then(() => process.exit(0))
-    .catch((error) => {
-        console.error("Error during interaction:", error);
-        process.exit(1);
-    });
-
+  .then(() => process.exit(0))
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
 
 
 

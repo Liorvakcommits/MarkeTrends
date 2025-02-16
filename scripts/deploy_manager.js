@@ -1,42 +1,57 @@
-// scripts/deploy_manager.js
 const hre = require("hardhat");
-const fs = require("fs");
+const fs = require('fs');
+const path = require('path');
+const { setAddress, updateFromTxtFile } = require('../utils/address-manager');
 
 async function main() {
-    console.log("Starting deployment process...");
-
-    // ביטול מחיקת `artifacts/` כדי למנוע אובדן קובץ החוזה
-    console.log("Skipping cache clean to preserve artifacts.");
+    console.log("פריסת חוזים עם החשבון:");
 
     const [deployer] = await hre.ethers.getSigners();
-    console.log("Deploying MarketManager with account:", deployer.address);
+    console.log("כתובת המפיץ:", deployer.address);
 
-    // בדיקה אם `artifacts/` באמת מכיל את `MarketManager.json`
-    const artifactsPath = "./artifacts/contracts/MarketManager.sol/MarketManager.json";
-    if (!fs.existsSync(artifactsPath)) {
-        console.error("❌ Error: MarketManager.json not found in artifacts!");
-        console.error("Try running: npx hardhat compile --force");
-        process.exit(1);
-    }
+    const balance = await deployer.provider.getBalance(deployer.address);
+    console.log("יתרת החשבון:", hre.ethers.formatEther(balance), "ETH");
 
+    // פריסת MarketManagerHelper
+    console.log("פורס MarketManagerHelper...");
+    const MarketManagerHelper = await hre.ethers.getContractFactory("MarketManagerHelper");
+    const marketManagerHelper = await MarketManagerHelper.deploy();
+    await marketManagerHelper.waitForDeployment();
+    const helperAddress = await marketManagerHelper.getAddress();
+    console.log("MarketManagerHelper נפרס בכתובת:", helperAddress);
+
+    // כתובות של חוזים קיימים
+    const mtcAddress = "0xDa8337dE835b0e3f35aBca046eA53508BBcB4fd0"; // כתובת ה-MTC
+    const conditionalTokensAddress = "0xA8Cc778572FD192d1aCDDc520C144db7a6ae1547"; // כתובת ה-ConditionalTokens
+    const oracleAddress = "0x326C977E6efc84E512bB9C30f76E30c160eD06FB"; // כתובת ה-Oracle
+
+    // פריסת MarketManager
+    console.log("פורס MarketManager...");
     const MarketManager = await hre.ethers.getContractFactory("MarketManager");
+    const marketManager = await MarketManager.deploy(
+        mtcAddress,
+        conditionalTokensAddress,
+        oracleAddress,
+        helperAddress
+    );
 
-    // פריסה של החוזה
-    const marketManager = await MarketManager.deploy(deployer.address);
-
-    console.log("Transaction Hash:", marketManager.deploymentTransaction().hash);
     await marketManager.waitForDeployment();
+    const managerAddress = await marketManager.getAddress();
+    console.log("MarketManager נפרס בכתובת:", managerAddress);
 
-    const contractAddress = await marketManager.getAddress();
-    console.log("MarketManager deployed at:", contractAddress);
+    // כתיבה לקובץ txt
+    const txtContent = `MarketManager: ${managerAddress}\nMarketManagerHelper: ${helperAddress}\n`;
+    const txtPath = path.join(__dirname, 'deployed_manager_addresses.txt');
+    fs.writeFileSync(txtPath, txtContent);
+    console.log(`הכתובות נשמרו בקובץ ${txtPath}`);
 
-    // שמירת הכתובת לקובץ כדי למנוע טעינת כתובת ישנה
-    fs.writeFileSync("./deployed_address.txt", contractAddress);
-    console.log("Deployment successful! Address saved to deployed_address.txt");
+    // עדכון הכתובות המרכזיות
+    updateFromTxtFile(txtPath);
+
+    console.log("🎉 הפריסה הושלמה בהצלחה!");
 }
 
 main().catch((error) => {
-    console.error("❌ Deployment failed:", error);
+    console.error("❌ הפריסה נכשלה:", error);
     process.exitCode = 1;
 });
-

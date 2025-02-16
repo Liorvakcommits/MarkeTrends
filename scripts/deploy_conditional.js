@@ -1,29 +1,37 @@
-const { ethers } = require("hardhat");
+const hre = require("hardhat");
+const fs = require("fs");
+const path = require("path");
 
 async function main() {
-  console.log("=== Deploying ConditionalTokens (Gnosis) ===");
-  // יוצרים factory עבור חוזה ConditionalTokens
-  const ConditionalTokensFactory = await ethers.getContractFactory("ConditionalTokens");
-  // פורסים
-  const conditionalTokens = await ConditionalTokensFactory.deploy();
-  await conditionalTokens.deployed();
-  console.log("ConditionalTokens deployed at:", conditionalTokens.address);
+    console.log("🚀 פריסת ConditionalTokens (Gnosis)...");
 
-  console.log("=== Deploying MarketManager ===");
-  // כאן נניח שיש לנו כתובת collateralToken מוכנה
-  const collateralTokenAddress = "0x0000000000000000000000000000000000000000"; 
-  // החלף בכתובת ERC20 אמיתית אם יש לך
+    const [deployer] = await hre.ethers.getSigners();
+    console.log("🔹 כתובת המפיץ:", deployer.address);
 
-  const MarketManagerFactory = await ethers.getContractFactory("MarketManager");
-  const manager = await MarketManagerFactory.deploy(
-    conditionalTokens.address,
-    collateralTokenAddress
-  );
-  await manager.deployed();
-  console.log("MarketManager deployed at:", manager.address);
+    const ConditionalTokens = await hre.ethers.getContractFactory("ConditionalTokens");
+    const conditionalTokens = await ConditionalTokens.deploy();
+    await conditionalTokens.waitForDeployment();
+
+    const conditionalTokensAddress = await conditionalTokens.getAddress();
+    console.log("✅ ConditionalTokens נפרס בכתובת:", conditionalTokensAddress);
+
+    if (!conditionalTokensAddress) {
+        console.error("❌ שגיאה: כתובת ה-ConditionalTokens אינה מוגדרת!");
+        process.exit(1);
+    }
+
+    const deploymentPath = path.join(__dirname, "deployed_addresses.json");
+    let deployedAddresses = {};
+    if (fs.existsSync(deploymentPath)) {
+        deployedAddresses = JSON.parse(fs.readFileSync(deploymentPath, "utf8"));
+    }
+    deployedAddresses.ConditionalTokens = conditionalTokensAddress;
+    fs.writeFileSync(deploymentPath, JSON.stringify(deployedAddresses, null, 2));
+    console.log("📄 כתובת ConditionalTokens נשמרה בקובץ deployed_addresses.json");
 }
 
 main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
+    console.error("❌ הפריסה נכשלה:", error);
+    process.exitCode = 1;
 });
+

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 /**
- * @title TrendsCoins
+ * @title CollateralToken
  * @dev טוקן ERC20 שמאפשר לבעלים לעדכן את השם והסימבול.
  */
 contract CollateralToken is ERC20, Ownable {
@@ -16,21 +16,16 @@ contract CollateralToken is ERC20, Ownable {
      * @dev הבנאי מקבל:
      * - שם הטוקן (ERC20)
      * - הסימבול (ERC20)
-     * - כתובת הבעלים (Ownable)
      * - כמות ראשונית להנפקה
      */
     constructor(
         string memory name_,
         string memory symbol_,
-        address owner_,
         uint256 initialSupply
-    )
-        ERC20(name_, symbol_)
-        Ownable(owner_)
-    {
+    ) ERC20(name_, symbol_) Ownable() {
         _customName = name_;
         _customSymbol = symbol_;
-        _mint(owner_, initialSupply * 10**decimals());
+        _mint(msg.sender, initialSupply * 10**decimals());
     }
 
     /**
