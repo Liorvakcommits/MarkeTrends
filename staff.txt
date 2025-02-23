@@ -1,3 +1,318 @@
+rm -rf cache artifacts
+npx hardhat compile
+
+npx hardhat run scripts/deploy_manager.js --network polygon
+
+npx hardhat console --network polygon
+
+
+
+forge create contracts/SimpleMarketManager.sol:SimpleMarketManager --rpc-url https://polygon-mainnet.infura.io/v3/910875bd8abb4bb8bd3d47eab837019d --private-key 5d5605b46188ac1f056b5f05bece4584072db515e13f889643af4ed3dff78575
+
+forge create src/MarketManager.sol:MarketManager --rpc-url https://polygon-mainnet.infura.io/v3/910875bd8abb4bb8bd3d47eab837019d --private-key 5d5605b46188ac1f056b5f05bece4584072db515e13f889643af4ed3dff78575 --broadcast
+
+
+
+
+PRIVATE_KEY=5d5605b46188ac1f056b5f05bece4584072db515e13f889643af4ed3dff78575
+INFURA_PROJECT_ID=910875bd8abb4bb8bd3d47eab837019d
+USE_INFURA=true
+
+
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "./IConditionalTokens.sol";
+import "./MarketManagerHelper.sol";
+import "./FixedProductMarketMaker.sol";
+
+contract MarketManager is Ownable, ReentrancyGuard, ChainlinkClient {
+    using Chainlink for Chainlink.Request;
+
+    IERC20 public mtcToken;
+    IConditionalTokens public conditionalTokens;
+    MarketManagerHelper public helper;
+
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18; // 10 MTC נזילות ראשונית
+
+    struct Market {
+        uint256 id;
+        string name;
+        uint256 creationTime;
+        uint256 expirationTime;
+        bool isResolved;
+        address creator;
+        address fpmm;
+        bytes32 conditionId;
+        uint256 initialLiquidity;
+        uint256 parentMarketId;
+        bool isConditional;
+        bool parentCondition;
+        bytes32 oracleRequestId;
+    }
+
+    mapping(uint256 => Market) public markets;
+    uint256 public nextMarketId;
+
+    address public oracle;
+    bytes32 public jobId;
+    uint256 public fee;
+
+    event MarketCreated(uint256 indexed marketId, string name, address creator, address fpmm);
+    event ConditionalMarketCreated(uint256 indexed marketId, string name, address creator, address fpmm, uint256 parentMarketId, bool parentCondition);
+    event MarketFunded(uint256 indexed marketId, address funder, uint256 amount);
+    event MarketResolved(uint256 indexed marketId, bool outcome);
+    event MarketCancelled(uint256 indexed marketId, string reason);
+    event DebugMarketCreated(uint256 id, string name, uint256 creationTime, uint256 expirationTime, address creator);
+
+    constructor(
+        IERC20 _mtcToken,
+        IConditionalTokens _conditionalTokens,
+        address _oracle,
+        MarketManagerHelper _helper
+    ) {
+        mtcToken = IERC20(_mtcToken);
+        conditionalTokens = IConditionalTokens(_conditionalTokens);
+        helper = MarketManagerHelper(_helper);
+        oracle = _oracle;
+        nextMarketId = 1;
+        setChainlinkToken(address(_mtcToken));
+    }
+
+    modifier marketExists(uint256 _marketId) {
+        require(_marketId > 0 && _marketId < nextMarketId, "Market does not exist");
+        _;
+    }
+
+    modifier marketNotResolved(uint256 _marketId) {
+        require(!markets[_marketId].isResolved, "Market already resolved");
+        _;
+    }
+
+    modifier marketExpired(uint256 _marketId) {
+        require(block.timestamp >= markets[_marketId].expirationTime, "Market not expired yet");
+        _;
+    }
+
+    function createMarket(string memory _name, uint256 _duration) external {
+        require(bytes(_name).length > 0, "Market name cannot be empty");
+        require(_duration > 0, "Duration must be positive");
+        _createMarket(_name, _duration, 0, 0, false, false);
+    }
+
+    function createConditionalMarket(string memory _name, uint256 _duration, uint256 _parentMarketId, bool _parentCondition) external {
+        require(bytes(_name).length > 0, "Market name cannot be empty");
+        require(_duration > 0, "Duration must be positive");
+        require(_parentMarketId > 0 && _parentMarketId < nextMarketId, "Invalid parent market");
+        require(!markets[_parentMarketId].isResolved, "Parent market already resolved");
+        _createMarket(_name, _duration, 0, _parentMarketId, true, _parentCondition);
+    }
+
+    function _createMarket(
+        string memory _name,
+        uint256 _duration,
+        uint256 _initialLiquidity,
+        uint256 _parentMarketId,
+        bool _isConditional,
+        bool _parentCondition
+    ) internal {
+        emit DebugMarketCreated(nextMarketId, _name, block.timestamp, block.timestamp + _duration, msg.sender);
+
+        uint256 liquidityToAdd = _initialLiquidity > 0 ? _initialLiquidity : MIN_INITIAL_LIQUIDITY;
+
+        uint256 marketId = nextMarketId++;
+        emit DebugMarketCreated(marketId, " Market ID Assigned", block.timestamp, block.timestamp + _duration, msg.sender);
+
+        bytes32 questionId = keccak256(abi.encodePacked(address(this), marketId, block.timestamp));
+        conditionalTokens.prepareCondition(address(this), questionId, 2);
+        bytes32 conditionId = conditionalTokens.getConditionId(address(this), questionId, 2);
+        emit DebugMarketCreated(marketId, " Condition Created", block.timestamp, block.timestamp + _duration, msg.sender);
+
+        emit DebugMarketCreated(marketId, "Before FPMM Creation", block.timestamp, block.timestamp + _duration, msg.sender);
+        FixedProductMarketMaker fpmm = new FixedProductMarketMaker(
+            mtcToken,
+            conditionalTokens,
+            conditionId,
+            2
+        );
+        emit DebugMarketCreated(marketId, "After FPMM Creation", block.timestamp, block.timestamp + _duration, msg.sender);
+
+        require(address(fpmm) != address(0), "Failed to create FPMM");
+
+        if (mtcToken.balanceOf(address(this)) >= liquidityToAdd) {
+            require(mtcToken.transfer(address(fpmm), liquidityToAdd), "Failed to transfer initial liquidity");
+            fpmm.addLiquidity(liquidityToAdd);
+        }
+
+        emit DebugMarketCreated(marketId, " MTC Transferred (if applicable)", block.timestamp, block.timestamp + _duration, msg.sender);
+
+        markets[marketId] = Market({
+            id: marketId,
+            name: _name,
+            creationTime: block.timestamp,
+            expirationTime: block.timestamp + _duration,
+            isResolved: false,
+            creator: msg.sender,
+            fpmm: address(fpmm),
+            conditionId: conditionId,
+            initialLiquidity: liquidityToAdd,
+            parentMarketId: _parentMarketId,
+            isConditional: _isConditional,
+            parentCondition: _parentCondition,
+            oracleRequestId: bytes32(0)
+        });
+
+        emit DebugMarketCreated(marketId, " Market Saved in Storage", block.timestamp, block.timestamp + _duration, msg.sender);
+        emit DebugMarketCreated(nextMarketId, "Entering _createMarket()", block.timestamp, block.timestamp + _duration, msg.sender);
+        emit DebugMarketCreated(nextMarketId, _name, block.timestamp, block.timestamp + _duration, msg.sender);
+        emit DebugMarketCreated(nextMarketId, " _parentMarketId", _parentMarketId, block.timestamp, msg.sender);
+        emit DebugMarketCreated(nextMarketId, " _isConditional", _isConditional ? 1 : 0, block.timestamp, msg.sender);
+        emit DebugMarketCreated(nextMarketId, " _initialLiquidity", _initialLiquidity, block.timestamp, msg.sender);
+
+        if (_isConditional) {
+            emit ConditionalMarketCreated(marketId, _name, msg.sender, address(fpmm), _parentMarketId, _parentCondition);
+        } else {
+            emit MarketCreated(marketId, _name, msg.sender, address(fpmm));
+        }
+    }
+
+    function fundMarket(uint256 _marketId, uint256 _amount) external {
+        Market storage market = markets[_marketId];
+        require(market.id != 0, "Market does not exist");
+        require(!market.isResolved, "Market is already resolved");
+        require(_amount > 0, "Funding amount must be greater than 0");
+
+        require(mtcToken.transferFrom(msg.sender, address(this), _amount), "Failed to transfer MTC tokens");
+        require(mtcToken.approve(market.fpmm, _amount), "Failed to approve FPMM");
+
+        FixedProductMarketMaker fpmm = FixedProductMarketMaker(market.fpmm);
+        fpmm.addLiquidity(_amount);
+
+        emit MarketFunded(_marketId, msg.sender, _amount);
+    }
+
+    function requestMarketResolution(uint256 _marketId) external onlyOwner marketExists(_marketId) marketNotResolved(_marketId) marketExpired(_marketId) {
+        Market storage market = markets[_marketId];
+        Chainlink.Request memory request = buildChainlinkRequest(jobId, address(this), this.fulfillMarketResolution.selector);
+        
+        request.add("marketId", helper.uint2str(market.id));
+        market.oracleRequestId = sendChainlinkRequestTo(oracle, request, fee);
+    }
+
+    function fulfillMarketResolution(bytes32 _requestId, bool _outcome) external recordChainlinkFulfillment(_requestId) {
+        for (uint256 i = 1; i < nextMarketId; i++) {
+            if (markets[i].oracleRequestId == _requestId) {
+                _resolveMarket(i, _outcome);
+                return;
+            }
+        }
+        revert("Market not found");
+    }
+
+    function _resolveMarket(uint256 _marketId, bool _outcome) internal marketExists(_marketId) marketNotResolved(_marketId) marketExpired(_marketId) {
+        Market storage market = markets[_marketId];
+
+        if (market.isConditional) {
+            if (markets[market.parentMarketId].parentCondition != _outcome) {
+                _cancelMarket(_marketId, "Parent market condition not met");
+                return;
+            }
+        }
+
+        market.isResolved = true;
+
+        uint256[] memory payouts = new uint256[](2);
+        payouts[_outcome ? 0 : 1] = 1;
+        conditionalTokens.reportPayouts(market.conditionId, payouts);
+
+        emit MarketResolved(_marketId, _outcome);
+    }
+
+    function _cancelMarket(uint256 _marketId, string memory _reason) internal {
+        Market storage market = markets[_marketId];
+        market.isResolved = true;
+
+        uint256[] memory payouts = new uint256[](2);
+        payouts[0] = 1;
+        payouts[1] = 1;
+        conditionalTokens.reportPayouts(market.conditionId, payouts);
+
+        emit MarketCancelled(_marketId, _reason);
+    }
+
+    function addTrustedCreator(address _creator) external onlyOwner {
+        // הוספת יוצר מורשה
+    }
+
+    function removeTrustedCreator(address _creator) external onlyOwner {
+        // הסרת יוצר מורשה
+    }
+
+    function setHelperAddress(address _helperAddress) external onlyOwner {
+        require(_helperAddress != address(0), "Invalid helper address");
+        helper = MarketManagerHelper(_helperAddress);
+    }
+
+    function getMarketInfo(uint256 _marketId) external view returns (
+        string memory name,
+        uint256 creationTime,
+        uint256 expirationTime,
+        bool isResolved,
+        address creator,
+        address fpmm,
+        uint256 initialLiquidity,
+        bool isConditional,
+        uint256 parentMarketId
+    ) {
+        Market storage market = markets[_marketId];
+        return (
+            market.name,
+            market.creationTime,
+            market.expirationTime,
+            market.isResolved,
+            market.creator,
+            market.fpmm,
+            market.initialLiquidity,
+            market.isConditional,
+            market.parentMarketId
+        );
+    }
+
+    function getMarketDetails(uint256 marketId) external view returns (
+        string memory name,
+        uint256 duration,
+        uint256 initialLiquidity,
+        bool isResolved
+    ) {
+        Market storage market = markets[marketId];
+        return (market.name, market.expirationTime - market.creationTime, market.initialLiquidity, market.isResolved);
+    }
+
+    function getMarketCount() public view returns (uint256) {
+        return nextMarketId - 1;
+    }
+}
+
+
+
+
+
+
+
+
+
+////  contracts/FixedProductMarketMaker.sol/////////
+
+
+
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
@@ -24,28 +339,20 @@ contract FixedProductMarketMaker {
         bytes32 _conditionId,
         uint256 _outcomeSlotCount
     ) {
-        require(_outcomeSlotCount > 0, "Outcome slot count must be greater than 0");
-
+        require(address(_collateralToken) != address(0), "Invalid collateral token");
+        require(address(_conditionalTokens) != address(0), "Invalid conditional tokens");
+        require(_outcomeSlotCount > 1, "There must be at least two outcome slots");
+        
         collateralToken = _collateralToken;
         conditionalTokens = _conditionalTokens;
         conditionId = _conditionId;
         outcomeSlotCount = _outcomeSlotCount;
         outcomeBalances = new uint256[](_outcomeSlotCount);
-
-        require(address(collateralToken) != address(0), "Invalid collateral token address");
-        require(address(conditionalTokens) != address(0), "Invalid conditional tokens address");
-
-        emit FPMMFunded(msg.sender, new uint256;
     }
-
+    
     function addLiquidity(uint256 addedFunds) external {
-        require(addedFunds > 0, "Cannot add 0 liquidity");
-
-        // לוודא שהיתרה באמת הועברה
+        require(addedFunds > 0, "Added funds must be greater than 0");
         require(collateralToken.transferFrom(msg.sender, address(this), addedFunds), "Transfer failed");
-
-        uint256 contractBalance = collateralToken.balanceOf(address(this));
-        require(contractBalance >= addedFunds, "Insufficient contract balance to add liquidity");
 
         uint256 mintAmount;
         if (totalLiquidity == 0) {
@@ -54,8 +361,7 @@ contract FixedProductMarketMaker {
                 outcomeBalances[i] = addedFunds;
             }
         } else {
-            require(contractBalance > addedFunds, "Invalid contract balance for mint calculation");
-
+            uint256 contractBalance = collateralToken.balanceOf(address(this));
             mintAmount = (addedFunds * totalLiquidity) / (contractBalance - addedFunds);
             for (uint256 i = 0; i < outcomeSlotCount; i++) {
                 uint256 proportion = (outcomeBalances[i] * addedFunds) / (contractBalance - addedFunds);
@@ -72,12 +378,9 @@ contract FixedProductMarketMaker {
 
         emit FPMMFunded(msg.sender, amountsAdded, mintAmount);
     }
-}
 
 
     function removeLiquidity(uint256 shares) external {
-        require(shares > 0, "Cannot remove 0 shares");
-        require(shares <= totalLiquidity, "Shares exceed total liquidity");
 
         uint256 collateralAmount = (shares * collateralToken.balanceOf(address(this))) / totalLiquidity;
         totalLiquidity = totalLiquidity - shares;
@@ -86,19 +389,14 @@ contract FixedProductMarketMaker {
             outcomeBalances[i] = outcomeBalances[i] - collateralAmount;
         }
 
-        require(collateralToken.transfer(msg.sender, collateralAmount), "Transfer failed");
 
         emit FPMMRedeem(msg.sender, collateralAmount);
     }
 
     function buy(uint256 investmentAmount, uint256 outcomeIndex) external {
-        require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
-        require(investmentAmount > 0, "Investment amount must be greater than 0");
 
         uint256 outcomeTokensToBuy = calcBuyAmount(investmentAmount, outcomeIndex);
-        require(outcomeTokensToBuy > 0, "Computed outcome tokens amount is 0");
 
-        require(collateralToken.transferFrom(msg.sender, address(this), investmentAmount), "Transfer failed");
 
         outcomeBalances[outcomeIndex] = outcomeBalances[outcomeIndex] + investmentAmount;
 
@@ -116,11 +414,8 @@ contract FixedProductMarketMaker {
     }
 
     function sell(uint256 returnAmount, uint256 outcomeIndex) external {
-        require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
-        require(returnAmount > 0, "Return amount must be greater than 0");
 
         uint256 outcomeTokensToSell = calcSellAmount(returnAmount, outcomeIndex);
-        require(outcomeTokensToSell > 0, "Computed outcome tokens amount is 0");
 
         conditionalTokens.safeTransferFrom(msg.sender, address(this), getPositionId(outcomeIndex), outcomeTokensToSell, "");
 
@@ -134,7 +429,6 @@ contract FixedProductMarketMaker {
 
         outcomeBalances[outcomeIndex] = outcomeBalances[outcomeIndex] - returnAmount;
 
-        require(collateralToken.transfer(msg.sender, returnAmount), "Transfer failed");
 
         emit Sell(msg.sender, returnAmount, outcomeIndex, outcomeTokensToSell);
     }
@@ -164,4 +458,861 @@ function partition(uint256 outcomeIndex) internal pure returns (uint256[] memory
 }
 
 
+}
+
+
+
+
+
+
+
+
+///// גרסה של marketmanager שפותחת שוק חדש///////
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "./IConditionalTokens.sol";
+import "./MarketManagerHelper.sol";
+import "./FixedProductMarketMaker.sol";
+
+contract MarketManager is Ownable, ReentrancyGuard, ChainlinkClient {
+    using Chainlink for Chainlink.Request;
+
+    IERC20 public mtcToken;
+    IConditionalTokens public conditionalTokens;
+    MarketManagerHelper public helper;
+
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18; // 10 MTC נזילות ראשונית
+
+    struct Market {
+        uint256 id;
+        string name;
+        uint256 creationTime;
+        uint256 expirationTime;
+        bool isResolved;
+        address creator;
+        address fpmm;
+        bytes32 conditionId;
+        uint256 initialLiquidity;
+        uint256 parentMarketId;
+        bool isConditional;
+        bool parentCondition;
+        bytes32 oracleRequestId;
+    }
+
+    mapping(uint256 => Market) public markets;
+    uint256 public nextMarketId;
+
+    address public oracle;
+    bytes32 public jobId;
+    uint256 public fee;
+
+    event MarketCreated(uint256 indexed marketId, string name, address creator, address fpmm);
+    event ConditionalMarketCreated(uint256 indexed marketId, string name, address creator, address fpmm, uint256 parentMarketId, bool parentCondition);
+    event MarketFunded(uint256 indexed marketId, address funder, uint256 amount);
+    event MarketResolved(uint256 indexed marketId, bool outcome);
+    event MarketCancelled(uint256 indexed marketId, string reason);
+    event DebugMarketCreated(uint256 id, string name, uint256 creationTime, uint256 expirationTime, address creator);
+
+    constructor(
+        IERC20 _mtcToken,
+        IConditionalTokens _conditionalTokens,
+        address _oracle,
+        MarketManagerHelper _helper
+    ) {
+        mtcToken = IERC20(_mtcToken);
+        conditionalTokens = IConditionalTokens(_conditionalTokens);
+        helper = MarketManagerHelper(_helper);
+        oracle = _oracle;
+        nextMarketId = 1;
+        setChainlinkToken(address(_mtcToken));
+    }
+
+    modifier marketExists(uint256 _marketId) {
+        require(_marketId > 0 && _marketId < nextMarketId, "Market does not exist");
+        _;
+    }
+
+    modifier marketNotResolved(uint256 _marketId) {
+        require(!markets[_marketId].isResolved, "Market already resolved");
+        _;
+    }
+
+    modifier marketExpired(uint256 _marketId) {
+        require(block.timestamp >= markets[_marketId].expirationTime, "Market not expired yet");
+        _;
+    }
+
+function createMarket(string memory _name, uint256 _duration) external {
+    require(bytes(_name).length > 0, "Market name cannot be empty");
+    require(_duration > 0, "Duration must be positive");
+
+    // ניסיון ליצור FPMM
+    address fpmm = address(new FixedProductMarketMaker(
+        mtcToken,
+        conditionalTokens,
+        bytes32(0), // צריך להגדיר נכון בהמשך
+        2 // מספר אפשרויות תוצאה
+    ));
+
+    // דרישה לוודא שה-FPMM נוצר בהצלחה
+    require(fpmm != address(0), "FPMM creation failed");
+
+    uint256 marketId = nextMarketId++;
+    markets[marketId] = Market({
+        id: marketId,
+        name: _name,
+        creationTime: block.timestamp,
+        expirationTime: block.timestamp + _duration,
+        isResolved: false,
+        creator: msg.sender,
+        fpmm: fpmm,
+        conditionId: bytes32(0),
+        initialLiquidity: MIN_INITIAL_LIQUIDITY,
+        parentMarketId: 0,
+        isConditional: false,
+        parentCondition: false,
+        oracleRequestId: bytes32(0)
+    });
+
+       emit MarketCreated(marketId, _name, msg.sender, fpmm);
+}
+
+}
+
+
+
+בוא נגדיר הרשאות ליצור חוזים חדשים לmarketmanager
+
+
+
+
+
+/// זאת גרסה שגם פותחת שוק וגם מיצרת fpm בצורה מושלמות //
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./IConditionalTokens.sol";
+
+contract FixedProductMarketMaker {
+    IERC20 public collateralToken;
+    IConditionalTokens public conditionalTokens;
+    bytes32 public conditionId;
+    uint256 public outcomeSlotCount;
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18;
+
+    uint256[] public outcomeBalances;
+    uint256 public totalLiquidity;
+
+    event FPMMFunded(address indexed funder, uint256[] amountsAdded, uint256 sharesMinted);
+    event FPMMRedeem(address indexed funder, uint256 amount);
+    event Buy(address indexed buyer, uint256 investmentAmount, uint256 outcomeIndex, uint256 outcomeTokensBought);
+    event Sell(address indexed seller, uint256 returnAmount, uint256 outcomeIndex, uint256 outcomeTokensSold);
+
+    constructor(
+        IERC20 _collateralToken,
+        IConditionalTokens _conditionalTokens,
+        bytes32 _conditionId,
+        uint256 _outcomeSlotCount
+    ) {
+        require(address(_collateralToken) != address(0), "Invalid collateral token");
+        require(address(_conditionalTokens) != address(0), "Invalid conditional tokens");
+        require(_outcomeSlotCount > 1, "There must be at least two outcome slots");
+        
+        collateralToken = _collateralToken;
+        conditionalTokens = _conditionalTokens;
+        conditionId = _conditionId;
+        outcomeSlotCount = _outcomeSlotCount;
+        outcomeBalances = new uint256[](_outcomeSlotCount);
+        
+        // הקצאת נזילות מינימלית כברירת מחדל
+        totalLiquidity = MIN_INITIAL_LIQUIDITY;
+        for (uint256 i = 0; i < outcomeSlotCount; i++) {
+            outcomeBalances[i] = MIN_INITIAL_LIQUIDITY / outcomeSlotCount;
+        }
+    }
+    
+    function addLiquidity(uint256 addedFunds) external {
+        require(addedFunds > 0, "Added funds must be greater than 0");
+        require(collateralToken.allowance(msg.sender, address(this)) >= addedFunds, "Not enough allowance");
+        require(collateralToken.transferFrom(msg.sender, address(this), addedFunds), "Transfer failed");
+
+        uint256 mintAmount;
+        if (totalLiquidity == 0) {
+            mintAmount = addedFunds;
+            for (uint256 i = 0; i < outcomeSlotCount; i++) {
+                outcomeBalances[i] = addedFunds;
+            }
+        } else {
+            uint256 contractBalance = collateralToken.balanceOf(address(this));
+            mintAmount = (addedFunds * totalLiquidity) / (contractBalance - addedFunds);
+            for (uint256 i = 0; i < outcomeSlotCount; i++) {
+                uint256 proportion = (outcomeBalances[i] * addedFunds) / (contractBalance - addedFunds);
+                outcomeBalances[i] += proportion;
+            }
+        }
+
+        totalLiquidity += mintAmount;
+
+        uint256[] memory amountsAdded = new uint256[](outcomeSlotCount);
+        for (uint256 i = 0; i < outcomeSlotCount; i++) {
+            amountsAdded[i] = addedFunds / outcomeSlotCount;
+        }
+
+        emit FPMMFunded(msg.sender, amountsAdded, mintAmount);
+    }
+}
+
+
+///זה הfixedproduct שעובד עם הmarketmanager ///
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./IConditionalTokens.sol";
+
+contract FixedProductMarketMaker {
+    IERC20 public collateralToken;
+    IConditionalTokens public conditionalTokens;
+    bytes32 public conditionId;
+    uint256 public outcomeSlotCount;
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18;
+
+    uint256[] public outcomeBalances;
+    uint256 public totalLiquidity;
+
+    event FPMMFunded(address indexed funder, uint256[] amountsAdded, uint256 sharesMinted);
+    event FPMMRedeem(address indexed funder, uint256 amount);
+    event Buy(address indexed buyer, uint256 investmentAmount, uint256 outcomeIndex, uint256 outcomeTokensBought);
+    event Sell(address indexed seller, uint256 returnAmount, uint256 outcomeIndex, uint256 outcomeTokensSold);
+    event MarketResolved(uint256 winningOutcomeIndex);
+
+    constructor(
+        IERC20 _collateralToken,
+        IConditionalTokens _conditionalTokens,
+        bytes32 _conditionId,
+        uint256 _outcomeSlotCount
+    ) {
+        require(address(_collateralToken) != address(0), "Invalid collateral token");
+        require(address(_conditionalTokens) != address(0), "Invalid conditional tokens");
+        require(_outcomeSlotCount > 1, "There must be at least two outcome slots");
+        
+        collateralToken = _collateralToken;
+        conditionalTokens = _conditionalTokens;
+        conditionId = _conditionId;
+        outcomeSlotCount = _outcomeSlotCount;
+        outcomeBalances = new uint256[](_outcomeSlotCount);
+        
+        // הקצאת נזילות מינימלית כברירת מחדל
+        totalLiquidity = MIN_INITIAL_LIQUIDITY;
+        for (uint256 i = 0; i < outcomeSlotCount; i++) {
+            outcomeBalances[i] = MIN_INITIAL_LIQUIDITY / outcomeSlotCount;
+        }
+    }
+    
+ 
+function buyTokens(uint256 amount, uint256 outcomeIndex) external {
+    require(amount > 0, "Must buy more than 0 tokens");
+    require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
+    require(outcomeBalances[outcomeIndex] > 0, "Market is empty");
+
+    uint256 price = (amount * 1e18) / (outcomeBalances[outcomeIndex] + 1); // מניעת חלוקה ב-0
+    require(collateralToken.transferFrom(msg.sender, address(this), price), "Transfer failed");
+
+    outcomeBalances[outcomeIndex] += amount;
+
+    emit Buy(msg.sender, price, outcomeIndex, amount);
+}
+
+
+function sellTokens(uint256 amount, uint256 outcomeIndex) external {
+    require(amount > 0, "Must sell more than 0 tokens");
+    require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
+    require(outcomeBalances[outcomeIndex] >= amount, "Not enough balance to sell");
+
+    uint256 price = (amount * 1e18) / (outcomeBalances[outcomeIndex] + 1); // מניעת חלוקה ב-0
+    outcomeBalances[outcomeIndex] -= amount;
+
+    require(collateralToken.transfer(msg.sender, price), "Transfer failed");
+
+    emit Sell(msg.sender, price, outcomeIndex, amount);
+}
+
+
+function addLiquidity(uint256 amount) external {
+    require(amount > 0, "Must add more than 0 tokens");
+    require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+
+    if (totalLiquidity == 0) {
+        totalLiquidity = amount;
+        for (uint256 i = 0; i < outcomeSlotCount; i++) {
+            outcomeBalances[i] = amount / outcomeSlotCount;
+        }
+    } else {
+        for (uint256 i = 0; i < outcomeSlotCount; i++) {
+            outcomeBalances[i] += amount / outcomeSlotCount;
+        }
+        totalLiquidity += amount;
+    }
+
+    emit FPMMFunded(msg.sender, new uint256[](outcomeSlotCount), amount);
+}
+
+
+function resolveMarket(uint256 winningOutcomeIndex) external {
+    require(winningOutcomeIndex < outcomeSlotCount, "Invalid winning outcome index");
+    require(totalLiquidity > 0, "Market has no liquidity");
+
+    for (uint256 i = 0; i < outcomeSlotCount; i++) {
+        if (i == winningOutcomeIndex) {
+            outcomeBalances[i] = totalLiquidity;
+        } else {
+            outcomeBalances[i] = 0;
+        }
+    }
+
+    emit MarketResolved(winningOutcomeIndex); // עכשיו `emit` יעבוד כמו שצריך
+}
+
+
+////פונקציית splitPosition שעובדת אבל תיקנו אותה זה הקוד לפני תיקון אם אצטרך לשחזר ///
+function splitPosition(
+    IERC20 collateralToken,
+    bytes32 parentCollectionId,
+    bytes32 conditionId,
+    uint256[] calldata partition,
+    uint256 amount
+) external override {
+    require(amount > 0, "Amount must be greater than zero");
+    require(partition.length > 1, "Must split into at least two positions");
+
+    uint256 parentPositionId = CTHelpers.getPositionId(address(collateralToken), parentCollectionId);
+
+    if (parentCollectionId == bytes32(0)) {
+        require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        totalBalances[address(collateralToken)] += amount;
+    } else {
+        _burn(msg.sender, parentPositionId, amount);
+    }
+
+    uint256 totalMinted = 0;
+    for (uint256 i = 0; i < partition.length; i++) {
+        bytes32 collectionId = CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[i]);
+        uint256 positionId = CTHelpers.getPositionId(address(collateralToken), collectionId);
+
+        uint256 mintedAmount = amount / partition.length; // מחלקים באופן שווה לכל פוזיציה
+        _mint(msg.sender, positionId, mintedAmount, ""); // ✅ ודא שהמינטינג הולך למשתמש ולא נשאר בחוזה
+        totalMinted += mintedAmount;
+    }
+
+    require(totalMinted == amount, "Minted amount mismatch");
+    emit PositionSplit(msg.sender, collateralToken, parentCollectionId, conditionId, partition, amount);
+}
+
+
+
+
+
+////// גרסה טבה של conditionaltoken לפני השינויים שאני עושה כרגע //// 
+// SPDX-License-Identifier: LGPL-3.0
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol"; // ✅ הוספת התמיכה ב-IERC20
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import "./CTHelpers.sol";
+import "../IConditionalTokens.sol";
+
+contract ConditionalTokens is ERC1155, IConditionalTokens {
+    using CTHelpers for bytes32;
+    using SafeCast for uint256;
+
+    mapping(address => uint256) public totalBalances;
+    mapping(bytes32 => uint256) public outcomeSlotCounts;
+    mapping(bytes32 => address) public payoutNumerators;
+    mapping(bytes32 => uint256[]) public payoutDenominator;
+
+    constructor() ERC1155("") {}
+
+ function prepareCondition(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external override {
+    require(outcomeSlotCount > 1, "Must have at least two outcomes");
+
+    bytes32 conditionId = CTHelpers.getConditionId(oracle, questionId, outcomeSlotCount);
+    
+    require(conditionId != bytes32(0), "Invalid conditionId");
+
+    // 🔹 הוספת Debug: בדיקה אם ה- `conditionId` כבר קיים
+    require(outcomeSlotCounts[conditionId] == 0, "Condition already prepared!");
+
+    outcomeSlotCounts[conditionId] = outcomeSlotCount;
+    
+    // 🔹 הוספת Debug: לוודא שהערך באמת נשמר
+    require(outcomeSlotCounts[conditionId] > 0, "OutcomeSlotCount was not saved!");
+
+    emit ConditionPreparation(conditionId, oracle, questionId, outcomeSlotCount);
+}
+
+
+event Debug(string message, uint256 value);
+
+function splitPosition(
+    IERC20 collateralToken,
+    bytes32 parentCollectionId,
+    bytes32 conditionId,
+    uint256[] calldata partition,
+    uint256 amount
+) external override {
+    require(amount > 0, "Amount must be greater than zero");
+    require(partition.length > 1, "Must split into at least two positions");
+
+    uint256 parentPositionId = CTHelpers.getPositionId(address(collateralToken), parentCollectionId);
+
+    if (parentCollectionId == bytes32(0)) {
+        require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        totalBalances[address(collateralToken)] += amount;
+    } else {
+        require(balanceOf(msg.sender, parentPositionId) >= amount, "Insufficient parent position balance");
+        _burn(msg.sender, parentPositionId, amount);
+    }
+
+    uint256 totalMinted = 0;
+    for (uint256 i = 0; i < partition.length; i++) {
+        bytes32 collectionId = CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[i]); 
+        bytes32 positionId = bytes32(CTHelpers.getPositionId(address(collateralToken), collectionId)); // ✅ ודא שזה `bytes32`
+
+        uint256 mintedAmount = amount / partition.length; // מחלקים באופן שווה לכל פוזיציה
+        _mint(msg.sender, uint256(positionId), mintedAmount, ""); // ✅ המרה נכונה ל-uint256
+        totalMinted += mintedAmount;
+    }
+
+    require(totalMinted == amount, "Minted amount mismatch");
+    emit PositionSplit(msg.sender, collateralToken, parentCollectionId, conditionId, partition, amount);
+}
+
+
+
+
+
+    function mergePositions(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata partition,
+        uint256 amount
+    ) external override {
+        uint256 parentPositionId = CTHelpers.getPositionId(address(collateralToken), parentCollectionId);
+
+        for (uint256 i = 0; i < partition.length; i++) {
+            bytes32 collectionId = CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[i]);
+            uint256 positionId = CTHelpers.getPositionId(address(collateralToken), collectionId);
+
+            _burn(msg.sender, positionId, amount);
+        }
+
+        if (parentCollectionId == bytes32(0)) {
+            totalBalances[address(collateralToken)] -= amount;
+        } else {
+            uint256 collectionId = uint256(CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[0]));
+            uint256 positionId = CTHelpers.getPositionId(address(collateralToken), bytes32(collectionId));
+            _mint(msg.sender, positionId, amount, "");
+        }
+
+        emit PositionsMerge(msg.sender, collateralToken, parentCollectionId, conditionId, partition, amount);
+    }
+
+    function redeemPositions(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata indexSets
+    ) external override {
+        uint256 balance = balanceOf(msg.sender, CTHelpers.getPositionId(address(collateralToken), parentCollectionId));
+
+        _burn(msg.sender, CTHelpers.getPositionId(address(collateralToken), parentCollectionId), balance);
+
+        emit PayoutRedemption(msg.sender, collateralToken, parentCollectionId, conditionId, indexSets, balance);
+    }
+
+    function getOutcomeSlotCount(bytes32 conditionId) external view override returns (uint256) {
+        require(outcomeSlotCounts[conditionId] > 0, "Condition ID does not exist");
+        return outcomeSlotCounts[conditionId];
+    }
+
+    // ✅ פונקציה לבדיקה ישירה של `outcomeSlotCounts`
+    function debugOutcomeSlot(bytes32 conditionId) external view returns (uint256) {
+        return outcomeSlotCounts[conditionId];
+    }
+
+    function getConditionId(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external pure override returns (bytes32) {
+        return CTHelpers.getConditionId(oracle, questionId, outcomeSlotCount);
+    }
+
+    function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) external pure override returns (bytes32) {
+        return CTHelpers.getCollectionId(parentCollectionId, conditionId, indexSet);
+    }
+
+    function getPositionId(IERC20 collateralToken, bytes32 collectionId) external pure override returns (uint256) {
+        return CTHelpers.getPositionId(address(collateralToken), collectionId);
+    }
+    
+    function reportPayouts(bytes32 questionId, uint256[] calldata payouts) external override {
+    require(outcomeSlotCounts[questionId] > 0, "Condition ID does not exist");
+    require(payouts.length == outcomeSlotCounts[questionId], "Invalid payouts length");
+
+    payoutDenominator[questionId] = payouts;
+
+    emit ConditionResolution(questionId, msg.sender, questionId, outcomeSlotCounts[questionId], payouts);
+}
+
+}
+
+
+
+
+/// זה תוכן של marketmanager.sol לפני השינוי של קבלת קרב1155/////
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "./IConditionalTokens.sol";
+import "./MarketManagerHelper.sol";
+import "./FixedProductMarketMaker.sol";
+
+contract MarketManager is Ownable, ReentrancyGuard, ChainlinkClient {
+    using Chainlink for Chainlink.Request;
+
+    IERC20 public mtcToken;
+    IConditionalTokens public conditionalTokens;
+    MarketManagerHelper public helper;
+
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18; // 10 MTC נזילות ראשונית
+
+    struct Market {
+        uint256 id;
+        string name;
+        uint256 creationTime;
+        uint256 expirationTime;
+        bool isResolved;
+        address creator;
+        address fpmm;
+        bytes32 conditionId;
+        uint256 initialLiquidity;
+        uint256 parentMarketId;
+        bool isConditional;
+        bool parentCondition;
+        bytes32 oracleRequestId;
+    }
+
+    mapping(uint256 => Market) public markets;
+    uint256 public nextMarketId;
+
+    address public oracle;
+    bytes32 public jobId;
+    uint256 public fee;
+
+    event MarketCreated(uint256 indexed marketId, string name, address creator, address fpmm);
+    event ConditionalMarketCreated(uint256 indexed marketId, string name, address creator, address fpmm, uint256 parentMarketId, bool parentCondition);
+    event MarketFunded(uint256 indexed marketId, address funder, uint256 amount);
+    event MarketResolved(uint256 indexed marketId, bool outcome);
+    event MarketCancelled(uint256 indexed marketId, string reason);
+    event DebugMarketCreated(uint256 id, string name, uint256 creationTime, uint256 expirationTime, address creator);
+
+    constructor(
+        IERC20 _mtcToken,
+        IConditionalTokens _conditionalTokens,
+        address _oracle,
+        MarketManagerHelper _helper
+    ) {
+        mtcToken = IERC20(_mtcToken);
+        conditionalTokens = IConditionalTokens(_conditionalTokens);
+        helper = MarketManagerHelper(_helper);
+        oracle = _oracle;
+        nextMarketId = 1;
+        setChainlinkToken(address(_mtcToken));
+    }
+
+    modifier marketExists(uint256 _marketId) {
+        require(_marketId > 0 && _marketId < nextMarketId, "Market does not exist");
+        _;
+    }
+
+    modifier marketNotResolved(uint256 _marketId) {
+        require(!markets[_marketId].isResolved, "Market already resolved");
+        _;
+    }
+
+    modifier marketExpired(uint256 _marketId) {
+        require(block.timestamp >= markets[_marketId].expirationTime, "Market not expired yet");
+        _;
+    }
+function createMarket(string memory _name, uint256 _duration) external {
+    require(bytes(_name).length > 0, "Market name cannot be empty");
+    require(_duration > 0, "Duration must be positive");
+
+    uint256 outcomeSlotCount = 2; // יצירת משתנה `uint256`
+    bytes32 questionId = keccak256(abi.encode(address(this), nextMarketId, block.timestamp));
+    bytes32 conditionId = keccak256(abi.encode(msg.sender, questionId, outcomeSlotCount));
+
+    emit DebugMarketCreated(nextMarketId, "Before Condition ID Creation", block.timestamp, block.timestamp + _duration, msg.sender);
+    
+    require(conditionId != bytes32(0), "Invalid conditionId");
+
+    emit DebugMarketCreated(nextMarketId, "Before FPMM Creation", block.timestamp, block.timestamp + _duration, msg.sender);
+
+    require(address(mtcToken) != address(0), "MTC Token address is invalid");
+    require(address(conditionalTokens) != address(0), "ConditionalTokens address is invalid");
+
+    address fpmm = address(new FixedProductMarketMaker(
+        mtcToken,
+        conditionalTokens,
+        conditionId, 
+        outcomeSlotCount
+    ));
+
+    require(fpmm != address(0), "FPMM creation failed");
+
+    emit DebugMarketCreated(nextMarketId, "FPMM Created", block.timestamp, block.timestamp + _duration, fpmm);
+
+    uint256 marketId = nextMarketId++;
+    markets[marketId] = Market({
+        id: marketId,
+        name: _name,
+        creationTime: block.timestamp,
+        expirationTime: block.timestamp + _duration,
+        isResolved: false,
+        creator: msg.sender,
+        fpmm: fpmm,
+        conditionId: conditionId,
+        initialLiquidity: MIN_INITIAL_LIQUIDITY,
+        parentMarketId: 0,
+        isConditional: false,
+        parentCondition: false,
+        oracleRequestId: bytes32(0)
+    });
+
+    emit DebugMarketCreated(nextMarketId, "After Market Struct Update", block.timestamp, block.timestamp + _duration, msg.sender);
+    emit MarketCreated(marketId, _name, msg.sender, fpmm);
+}
+
+
+function createFPMM(uint256 _marketId) external {
+    require(markets[_marketId].id == _marketId, "Market does not exist");
+    require(markets[_marketId].fpmm == address(0), "FPMM already created");
+
+    uint256 outcomeSlotCount = 2; // הגדרת משתנה במקום שימוש ישיר במספר
+
+    bytes32 questionId = keccak256(abi.encode(address(this), _marketId, block.timestamp));
+    bytes32 conditionId = keccak256(abi.encode(msg.sender, questionId, outcomeSlotCount));
+
+    require(conditionId != bytes32(0), "Invalid conditionId");
+
+    address fpmm = address(new FixedProductMarketMaker(
+        mtcToken,
+        conditionalTokens,
+        conditionId, 
+        outcomeSlotCount
+    ));
+
+    require(fpmm != address(0), "FPMM creation failed");
+
+    // הדפסת כתובת ה-FPMM ל-debugging
+    emit DebugMarketCreated(_marketId, "FPMM Created", block.timestamp, block.timestamp + 86400, fpmm);
+
+    // עדכון הכתובת במבנה השוק
+    markets[_marketId].fpmm = fpmm;
+    markets[_marketId].conditionId = conditionId;
+
+    // הדפסת הכתובת שאוחסנה
+    emit DebugMarketCreated(_marketId, "FPMM Saved in Market", block.timestamp, block.timestamp + 86400, markets[_marketId].fpmm);
+}
+
+
+
+}
+
+
+
+
+
+////conditionaltoken האחרון 
+
+// // SPDX-License-Identifier: LGPL-3.0
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import "./CTHelpers.sol";
+import "../IConditionalTokens.sol";
+
+contract ConditionalTokens is ERC1155, IConditionalTokens, ERC1155Holder {
+    using CTHelpers for bytes32;
+    using SafeCast for uint256;
+
+    mapping(address => uint256) public totalBalances;
+    mapping(bytes32 => uint256) public outcomeSlotCounts;
+    mapping(bytes32 => address) public payoutNumerators;
+    mapping(bytes32 => uint256[]) public payoutDenominator;
+
+    constructor() ERC1155("") {}
+
+    // ✅ תיקון בעיית `supportsInterface`
+    function supportsInterface(bytes4 interfaceId) public view override(ERC1155, ERC1155Receiver, IERC165) returns (bool) {
+        return super.supportsInterface(interfaceId);
+    }
+
+    function prepareCondition(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external override {
+        require(outcomeSlotCount > 1, "Must have at least two outcomes");
+
+        bytes32 conditionId = CTHelpers.getConditionId(oracle, questionId, outcomeSlotCount);
+        require(conditionId != bytes32(0), "Invalid conditionId");
+        require(outcomeSlotCounts[conditionId] == 0, "Condition already prepared!");
+
+        outcomeSlotCounts[conditionId] = outcomeSlotCount;
+        require(outcomeSlotCounts[conditionId] > 0, "OutcomeSlotCount was not saved!");
+
+        emit ConditionPreparation(conditionId, oracle, questionId, outcomeSlotCount);
+    }
+
+    function splitPosition(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata partition,
+        uint256 amount
+    ) external override {
+        require(amount > 0, "Amount must be greater than zero");
+        require(partition.length > 1, "Must split into at least two positions");
+
+        uint256 parentPositionId = CTHelpers.getPositionId(address(collateralToken), parentCollectionId);
+
+        if (parentCollectionId == bytes32(0)) {
+            require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+            totalBalances[address(collateralToken)] += amount;
+        } else {
+            require(balanceOf(msg.sender, parentPositionId) >= amount, "Insufficient parent position balance");
+            _burn(msg.sender, parentPositionId, amount);
+        }
+
+        uint256 totalMinted = 0;
+        for (uint256 i = 0; i < partition.length; i++) {
+            bytes32 collectionId = CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[i]); 
+            uint256 positionId = CTHelpers.getPositionId(address(collateralToken), collectionId);
+
+            uint256 mintedAmount = amount / partition.length;
+            _mint(msg.sender, positionId, mintedAmount, "");
+            totalMinted += mintedAmount;
+
+            require(balanceOf(msg.sender, positionId) >= mintedAmount, "Minting failed - no tokens received!");
+        }
+
+        require(totalMinted == amount, "Minted amount mismatch");
+        emit PositionSplit(msg.sender, collateralToken, parentCollectionId, conditionId, partition, amount);
+    }
+
+    function mergePositions(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata partition,
+        uint256 amount
+    ) external override {
+        uint256 parentPositionId = CTHelpers.getPositionId(address(collateralToken), parentCollectionId);
+
+        for (uint256 i = 0; i < partition.length; i++) {
+            bytes32 collectionId = CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[i]);
+            uint256 positionId = CTHelpers.getPositionId(address(collateralToken), collectionId);
+
+            _burn(msg.sender, positionId, amount);
+        }
+
+        if (parentCollectionId == bytes32(0)) {
+            totalBalances[address(collateralToken)] -= amount;
+        } else {
+            uint256 collectionId = uint256(CTHelpers.getCollectionId(parentCollectionId, conditionId, partition[0]));
+            uint256 positionId = CTHelpers.getPositionId(address(collateralToken), bytes32(collectionId));
+            _mint(msg.sender, positionId, amount, "");
+        }
+
+        emit PositionsMerge(msg.sender, collateralToken, parentCollectionId, conditionId, partition, amount);
+    }
+
+    function redeemPositions(
+        IERC20 collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] calldata indexSets
+    ) external override {
+        uint256 balance = balanceOf(msg.sender, CTHelpers.getPositionId(address(collateralToken), parentCollectionId));
+
+        _burn(msg.sender, CTHelpers.getPositionId(address(collateralToken), parentCollectionId), balance);
+
+        emit PayoutRedemption(msg.sender, collateralToken, parentCollectionId, conditionId, indexSets, balance);
+    }
+
+    function getOutcomeSlotCount(bytes32 conditionId) external view override returns (uint256) {
+        require(outcomeSlotCounts[conditionId] > 0, "Condition ID does not exist");
+        return outcomeSlotCounts[conditionId];
+    }
+
+    function debugOutcomeSlot(bytes32 conditionId) external view returns (uint256) {
+        return outcomeSlotCounts[conditionId];
+    }
+
+    function getConditionId(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external pure override returns (bytes32) {
+        return CTHelpers.getConditionId(oracle, questionId, outcomeSlotCount);
+    }
+
+    function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) external pure override returns (bytes32) {
+        return CTHelpers.getCollectionId(parentCollectionId, conditionId, indexSet);
+    }
+
+    function getPositionId(IERC20 collateralToken, bytes32 collectionId) external pure override returns (uint256) {
+        return CTHelpers.getPositionId(address(collateralToken), collectionId);
+    }
+
+    function reportPayouts(bytes32 questionId, uint256[] calldata payouts) external override {
+        require(outcomeSlotCounts[questionId] > 0, "Condition ID does not exist");
+        require(payouts.length == outcomeSlotCounts[questionId], "Invalid payouts length");
+
+        payoutDenominator[questionId] = payouts;
+
+        emit ConditionResolution(questionId, msg.sender, questionId, outcomeSlotCounts[questionId], payouts);
+    }
+
+function onERC1155Received(
+        address,
+        address,
+        uint256,
+        uint256,
+        bytes memory
+    ) public pure override returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(
+        address,
+        address,
+        uint256[] memory,
+        uint256[] memory,
+        bytes memory
+    ) public pure override returns (bytes4) {
+        return this.onERC1155BatchReceived.selector;
+    }
 }

@@ -20,4 +20,8 @@ interface IConditionalTokens is IERC1155 {
     function getConditionId(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external pure returns (bytes32);
     function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) external pure returns (bytes32);
     function getPositionId(IERC20 collateralToken, bytes32 collectionId) external pure returns (uint256);
+
+    // ✅ פונקציה חדשה לבדיקה ישירה של outcomeSlotCounts
+    function debugOutcomeSlot(bytes32 conditionId) external view returns (uint256);
 }
+

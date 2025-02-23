@@ -9,14 +9,18 @@ contract FixedProductMarketMaker {
     IConditionalTokens public conditionalTokens;
     bytes32 public conditionId;
     uint256 public outcomeSlotCount;
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18;
 
     uint256[] public outcomeBalances;
     uint256 public totalLiquidity;
+    mapping(address => uint256) public userBalances;
 
     event FPMMFunded(address indexed funder, uint256[] amountsAdded, uint256 sharesMinted);
     event FPMMRedeem(address indexed funder, uint256 amount);
     event Buy(address indexed buyer, uint256 investmentAmount, uint256 outcomeIndex, uint256 outcomeTokensBought);
     event Sell(address indexed seller, uint256 returnAmount, uint256 outcomeIndex, uint256 outcomeTokensSold);
+    event MarketResolved(uint256 winningOutcomeIndex);
+    event LiquidityAdded(address indexed provider, uint256 amount);
 
     constructor(
         IERC20 _collateralToken,
@@ -27,120 +31,98 @@ contract FixedProductMarketMaker {
         require(address(_collateralToken) != address(0), "Invalid collateral token");
         require(address(_conditionalTokens) != address(0), "Invalid conditional tokens");
         require(_outcomeSlotCount > 1, "There must be at least two outcome slots");
-        
+
         collateralToken = _collateralToken;
         conditionalTokens = _conditionalTokens;
         conditionId = _conditionId;
         outcomeSlotCount = _outcomeSlotCount;
-        outcomeBalances = new uint256[](_outcomeSlotCount);
     }
-    
-    function addLiquidity(uint256 addedFunds) external {
-        require(addedFunds > 0, "Added funds must be greater than 0");
-        require(collateralToken.transferFrom(msg.sender, address(this), addedFunds), "Transfer failed");
 
-        uint256 mintAmount;
-        if (totalLiquidity == 0) {
-            mintAmount = addedFunds;
-            for (uint256 i = 0; i < outcomeSlotCount; i++) {
-                outcomeBalances[i] = addedFunds;
-            }
-        } else {
-            uint256 contractBalance = collateralToken.balanceOf(address(this));
-            mintAmount = (addedFunds * totalLiquidity) / (contractBalance - addedFunds);
-            for (uint256 i = 0; i < outcomeSlotCount; i++) {
-                uint256 proportion = (outcomeBalances[i] * addedFunds) / (contractBalance - addedFunds);
-                outcomeBalances[i] += proportion;
-            }
-        }
+    function splitPosition(uint256 amount, uint256 outcomeIndex) external {
+        require(amount > 0, "Must split more than 0 tokens");
+        require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
 
-        totalLiquidity += mintAmount;
+        bytes32 parentCollectionId = bytes32(0);
+        bytes32 collectionId = conditionalTokens.getCollectionId(parentCollectionId, conditionId, 1 << outcomeIndex);
 
-        uint256[] memory amountsAdded = new uint256[](outcomeSlotCount);
+        conditionalTokens.splitPosition(collateralToken, parentCollectionId, conditionId, new uint256[](outcomeSlotCount), amount);
+
+        userBalances[msg.sender] += amount;
+        emit Buy(msg.sender, amount, outcomeIndex, amount);
+    }
+
+    function mergePositions(uint256 amount, uint256 outcomeIndex) external {
+        require(amount > 0, "Must merge more than 0 tokens");
+        require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
+
+        bytes32 parentCollectionId = bytes32(0);
+        bytes32 collectionId = conditionalTokens.getCollectionId(parentCollectionId, conditionId, 1 << outcomeIndex);
+
+        conditionalTokens.mergePositions(collateralToken, parentCollectionId, conditionId, new uint256[](outcomeSlotCount), amount);
+
+        userBalances[msg.sender] -= amount;
+        emit Sell(msg.sender, amount, outcomeIndex, amount);
+    }
+
+    function redeemPositions(uint256[] calldata indexSets) external {
+        require(totalLiquidity > 0, "Market is not resolved yet");
+
+        bytes32 parentCollectionId = bytes32(0);
+        conditionalTokens.redeemPositions(collateralToken, parentCollectionId, conditionId, indexSets);
+
+        emit MarketResolved(indexSets[0]);
+    }
+
+    function addLiquidity(uint256 amount) external {
+        require(amount > 0, "Must add more than 0 tokens");
+        require(collateralToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+
+        totalLiquidity += amount;
+        userBalances[msg.sender] += amount;
+
+        emit LiquidityAdded(msg.sender, amount);
+    }
+
+    function buyTokens(uint256 amount, uint256 outcomeIndex) external {
+        require(amount > 0, "Must buy more than 0 tokens");
+        require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
+        require(outcomeBalances[outcomeIndex] > 0, "Market is empty");
+
+        uint256 price = (amount * 1e18) / (outcomeBalances[outcomeIndex] + 1);
+        require(collateralToken.transferFrom(msg.sender, address(this), price), "Transfer failed");
+
+        outcomeBalances[outcomeIndex] += amount;
+
+        emit Buy(msg.sender, price, outcomeIndex, amount);
+    }
+
+    function sellTokens(uint256 amount, uint256 outcomeIndex) external {
+        require(amount > 0, "Must sell more than 0 tokens");
+        require(outcomeIndex < outcomeSlotCount, "Invalid outcome index");
+        require(outcomeBalances[outcomeIndex] >= amount, "Not enough balance to sell");
+
+        uint256 price = (amount * 1e18) / (outcomeBalances[outcomeIndex] + 1);
+        outcomeBalances[outcomeIndex] -= amount;
+
+        require(collateralToken.transfer(msg.sender, price), "Transfer failed");
+
+        emit Sell(msg.sender, price, outcomeIndex, amount);
+    }
+
+    function resolveMarket(uint256 winningOutcomeIndex) external {
+        require(winningOutcomeIndex < outcomeSlotCount, "Invalid winning outcome index");
+        require(totalLiquidity > 0, "Market has no liquidity");
+
         for (uint256 i = 0; i < outcomeSlotCount; i++) {
-            amountsAdded[i] = addedFunds / outcomeSlotCount;
+            if (i == winningOutcomeIndex) {
+                outcomeBalances[i] = totalLiquidity;
+            } else {
+                outcomeBalances[i] = 0;
+            }
         }
 
-        emit FPMMFunded(msg.sender, amountsAdded, mintAmount);
+        emit MarketResolved(winningOutcomeIndex);
     }
-
-
-    function removeLiquidity(uint256 shares) external {
-
-        uint256 collateralAmount = (shares * collateralToken.balanceOf(address(this))) / totalLiquidity;
-        totalLiquidity = totalLiquidity - shares;
-
-        for (uint256 i = 0; i < outcomeSlotCount; i++) {
-            outcomeBalances[i] = outcomeBalances[i] - collateralAmount;
-        }
-
-
-        emit FPMMRedeem(msg.sender, collateralAmount);
-    }
-
-    function buy(uint256 investmentAmount, uint256 outcomeIndex) external {
-
-        uint256 outcomeTokensToBuy = calcBuyAmount(investmentAmount, outcomeIndex);
-
-
-        outcomeBalances[outcomeIndex] = outcomeBalances[outcomeIndex] + investmentAmount;
-
-        conditionalTokens.splitPosition(
-            collateralToken,
-            bytes32(0),
-            conditionId,
-            partition(outcomeIndex),
-            outcomeTokensToBuy
-        );
-
-        conditionalTokens.safeTransferFrom(address(this), msg.sender, getPositionId(outcomeIndex), outcomeTokensToBuy, "");
-
-        emit Buy(msg.sender, investmentAmount, outcomeIndex, outcomeTokensToBuy);
-    }
-
-    function sell(uint256 returnAmount, uint256 outcomeIndex) external {
-
-        uint256 outcomeTokensToSell = calcSellAmount(returnAmount, outcomeIndex);
-
-        conditionalTokens.safeTransferFrom(msg.sender, address(this), getPositionId(outcomeIndex), outcomeTokensToSell, "");
-
-        conditionalTokens.mergePositions(
-            collateralToken,
-            bytes32(0),
-            conditionId,
-            partition(outcomeIndex),
-            outcomeTokensToSell
-        );
-
-        outcomeBalances[outcomeIndex] = outcomeBalances[outcomeIndex] - returnAmount;
-
-
-        emit Sell(msg.sender, returnAmount, outcomeIndex, outcomeTokensToSell);
-    }
-
-    function calcBuyAmount(uint256 investmentAmount, uint256 outcomeIndex) public view returns (uint256) {
-        uint256 b = outcomeBalances[outcomeIndex];
-        uint256 bPrime = b + investmentAmount;
-        uint256 result = (totalLiquidity * (bPrime - b)) / b;
-        return result;
-    }
-
-    function calcSellAmount(uint256 returnAmount, uint256 outcomeIndex) public view returns (uint256) {
-        uint256 b = outcomeBalances[outcomeIndex];
-        uint256 bPrime = b - returnAmount;
-        uint256 result = (totalLiquidity * (b - bPrime)) / b;
-        return result;
-    }
-
-    function getPositionId(uint256 outcomeIndex) internal view returns (uint256) {
-        return uint256(keccak256(abi.encodePacked(collateralToken, conditionId, 1 << outcomeIndex)));
-    }
-
-function partition(uint256 outcomeIndex) internal pure returns (uint256[] memory) {
-    uint256[] memory partitionResult = new uint256[](1);
-    partitionResult[0] = 1 << outcomeIndex;
-    return partitionResult;
 }
 
 
-}
