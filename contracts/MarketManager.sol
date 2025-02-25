@@ -187,3 +187,6 @@ contract MarketManager is Ownable, ReentrancyGuard, ChainlinkClient, ERC1155Hold
 
 
 
+
+
+

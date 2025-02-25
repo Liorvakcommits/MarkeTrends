@@ -1316,3 +1316,360 @@ function onERC1155Received(
         return this.onERC1155BatchReceived.selector;
     }
 }
+
+
+
+
+
+
+/// שינויים שאני עושה לmarketmanager.sol לפני שינויים של chainlink לאירועי הספורט זה הקובץ לפני השינויים 
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
+import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Receiver.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
+import "./IConditionalTokens.sol";
+import "./MarketManagerHelper.sol";
+import "./FixedProductMarketMaker.sol";
+
+contract MarketManager is Ownable, ReentrancyGuard, ChainlinkClient, ERC1155Holder {
+    using Chainlink for Chainlink.Request;
+
+    IERC20 public mtcToken;
+    IConditionalTokens public conditionalTokens;
+    MarketManagerHelper public helper;
+
+    uint256 public constant MIN_INITIAL_LIQUIDITY = 10 * 10**18; // 10 MTC נזילות ראשונית
+
+    struct Market {
+        uint256 id;
+        string name;
+        uint256 creationTime;
+        uint256 expirationTime;
+        bool isResolved;
+        address creator;
+        address fpmm;
+        bytes32 conditionId;
+        uint256 initialLiquidity;
+        uint256 parentMarketId;
+        bool isConditional;
+        bool parentCondition;
+        bytes32 oracleRequestId;
+    }
+
+    mapping(uint256 => Market) public markets;
+    uint256 public nextMarketId;
+
+    address public oracle;
+    bytes32 public jobId;
+    uint256 public fee;
+
+    event MarketCreated(uint256 indexed marketId, string name, address creator, address fpmm);
+    event ConditionalMarketCreated(uint256 indexed marketId, string name, address creator, address fpmm, uint256 parentMarketId, bool parentCondition);
+    event MarketFunded(uint256 indexed marketId, address funder, uint256 amount);
+    event MarketResolved(uint256 indexed marketId, bool outcome);
+    event MarketCancelled(uint256 indexed marketId, string reason);
+    event DebugMarketCreated(uint256 id, string name, uint256 creationTime, uint256 expirationTime, address creator);
+
+    constructor(
+        IERC20 _mtcToken,
+        IConditionalTokens _conditionalTokens,
+        address _oracle,
+        MarketManagerHelper _helper
+    ) {
+        mtcToken = IERC20(_mtcToken);
+        conditionalTokens = IConditionalTokens(_conditionalTokens);
+        helper = MarketManagerHelper(_helper);
+        oracle = _oracle;
+        nextMarketId = 1;
+        setChainlinkToken(address(_mtcToken));
+    }
+
+    modifier marketExists(uint256 _marketId) {
+        require(_marketId > 0 && _marketId < nextMarketId, "Market does not exist");
+        _;
+    }
+
+    modifier marketNotResolved(uint256 _marketId) {
+        require(!markets[_marketId].isResolved, "Market already resolved");
+        _;
+    }
+
+    modifier marketExpired(uint256 _marketId) {
+        require(block.timestamp >= markets[_marketId].expirationTime, "Market not expired yet");
+        _;
+    }
+
+    function createMarket(string memory _name, uint256 _duration) external {
+        require(bytes(_name).length > 0, "Market name cannot be empty");
+        require(_duration > 0, "Duration must be positive");
+
+        uint256 outcomeSlotCount = 2;
+        bytes32 questionId = keccak256(abi.encode(address(this), nextMarketId, block.timestamp));
+        bytes32 conditionId = keccak256(abi.encode(msg.sender, questionId, outcomeSlotCount));
+
+        emit DebugMarketCreated(nextMarketId, "Before Condition ID Creation", block.timestamp, block.timestamp + _duration, msg.sender);
+        
+        require(conditionId != bytes32(0), "Invalid conditionId");
+
+        emit DebugMarketCreated(nextMarketId, "Before FPMM Creation", block.timestamp, block.timestamp + _duration, msg.sender);
+
+        require(address(mtcToken) != address(0), "MTC Token address is invalid");
+        require(address(conditionalTokens) != address(0), "ConditionalTokens address is invalid");
+
+        address fpmm = address(new FixedProductMarketMaker(
+            mtcToken,
+            conditionalTokens,
+            conditionId, 
+            outcomeSlotCount
+        ));
+
+        require(fpmm != address(0), "FPMM creation failed");
+
+        emit DebugMarketCreated(nextMarketId, "FPMM Created", block.timestamp, block.timestamp + _duration, fpmm);
+
+        uint256 marketId = nextMarketId++;
+        markets[marketId] = Market({
+            id: marketId,
+            name: _name,
+            creationTime: block.timestamp,
+            expirationTime: block.timestamp + _duration,
+            isResolved: false,
+            creator: msg.sender,
+            fpmm: fpmm,
+            conditionId: conditionId,
+            initialLiquidity: MIN_INITIAL_LIQUIDITY,
+            parentMarketId: 0,
+            isConditional: false,
+            parentCondition: false,
+            oracleRequestId: bytes32(0)
+        });
+
+        emit DebugMarketCreated(nextMarketId, "After Market Struct Update", block.timestamp, block.timestamp + _duration, msg.sender);
+        emit MarketCreated(marketId, _name, msg.sender, fpmm);
+    }
+
+    function createFPMM(uint256 _marketId) external {
+        require(markets[_marketId].id == _marketId, "Market does not exist");
+        require(markets[_marketId].fpmm == address(0), "FPMM already created");
+
+        uint256 outcomeSlotCount = 2;
+        bytes32 questionId = keccak256(abi.encode(address(this), _marketId, block.timestamp));
+        bytes32 conditionId = keccak256(abi.encode(msg.sender, questionId, outcomeSlotCount));
+
+        require(conditionId != bytes32(0), "Invalid conditionId");
+
+        address fpmm = address(new FixedProductMarketMaker(
+            mtcToken,
+            conditionalTokens,
+            conditionId, 
+            outcomeSlotCount
+        ));
+
+        require(fpmm != address(0), "FPMM creation failed");
+
+        emit DebugMarketCreated(_marketId, "FPMM Created", block.timestamp, block.timestamp + 86400, fpmm);
+
+        markets[_marketId].fpmm = fpmm;
+        markets[_marketId].conditionId = conditionId;
+
+        emit DebugMarketCreated(_marketId, "FPMM Saved in Market", block.timestamp, block.timestamp + 86400, markets[_marketId].fpmm);
+    }
+
+    // ✅ תיקון תאימות לפונקציות ERC1155Receiver
+    function onERC1155Received(
+        address operator,
+        address from,
+        uint256 id,
+        uint256 value,
+        bytes memory data
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(
+        address operator,
+        address from,
+        uint256[] memory ids,
+        uint256[] memory values,
+        bytes memory data
+    ) public virtual override returns (bytes4) {
+        return this.onERC1155BatchReceived.selector;
+    }
+
+    // ✅ פונקציה להעברת טוקנים מהחוזה
+    function redeemPositions(address token, uint256 positionId, uint256 amount) external onlyOwner {
+        IERC1155(token).safeTransferFrom(address(this), msg.sender, positionId, amount, "");
+    }
+}
+
+
+////אני משנה את ההאופציה הפונקציה requestSportsDataFromDraftKings() אני בתור owner require(markets[_marketId].expirationTime <= block.timestamp, "Market has not expired yet");
+ לזה require(
+    markets[_marketId].expirationTime <= block.timestamp || msg.sender == owner(),
+    "Market has not expired yet"
+);
+ יכול לסגור שוק גם ללא תאריך פקיעה לטובת הבדיקות לכן החלפתי את 
+
+
+
+
+ //כל הנתיבים לנושא הapi של הoptic 
+
+guidies:
+
+ https://opticodds.readme.io/reference/getting-started
+ https://opticodds.readme.io/docs/migrating-to-v3
+ https://opticodds.readme.io/docs/sportsbooks
+ https://opticodds.readme.io/docs/leagues
+
+ https://opticodds.readme.io/docs/getting-started-1
+ https://opticodds.readme.io/docs/default-settings
+ https://opticodds.readme.io/docs/configurations
+ https://opticodds.readme.io/docs/trading-floor
+ https://opticodds.readme.io/docs/data-ingestion
+
+api rederence
+documentation:
+
+https://opticodds.readme.io/reference/getting-started
+https://opticodds.readme.io/docs/migrating-to-v3
+https://opticodds.readme.io/reference/authentication
+https://opticodds.readme.io/reference/fixtures-lifecycle
+https://opticodds.readme.io/reference/common-issues
+
+OpticOdds:
+common:
+https://opticodds.readme.io/reference/get_sports
+https://opticodds.readme.io/reference/get_sports-active
+https://opticodds.readme.io/reference/get_leagues
+https://opticodds.readme.io/reference/get_leagues-active
+https://opticodds.readme.io/reference/get_sportsbooks
+https://opticodds.readme.io/reference/get_sportsbooks-active
+https://opticodds.readme.io/reference/get_sportsbooks-last-polled
+https://opticodds.readme.io/reference/get_markets
+https://opticodds.readme.io/reference/get_markets-active
+https://opticodds.readme.io/reference/get_markets-settleable
+
+squads:
+https://opticodds.readme.io/reference/get_teams
+https://opticodds.readme.io/reference/get_players
+
+fixtures:
+https://opticodds.readme.io/reference/get_fixtures
+https://opticodds.readme.io/reference/get_fixtures-active
+https://opticodds.readme.io/reference/get_tournaments
+https://opticodds.readme.io/reference/get_conferences
+https://opticodds.readme.io/reference/get_divisions
+
+odds:
+https://opticodds.readme.io/reference/get_fixtures-odds
+https://opticodds.readme.io/reference/get_fixtures-odds-historical
+
+results:
+https://opticodds.readme.io/reference/get_fixtures-results
+https://opticodds.readme.io/reference/get_fixtures-player-results
+https://opticodds.readme.io/reference/get_tournaments-results
+https://opticodds.readme.io/reference/get_fixtures-player-results-last-x
+https://opticodds.readme.io/reference/get_fixtures-results-head-to-head
+
+futures:
+https://opticodds.readme.io/reference/get_futures
+https://opticodds.readme.io/reference/get_futures-odds
+
+garder:
+https://opticodds.readme.io/reference/get_grader-odds
+https://opticodds.readme.io/reference/get_grader-futures
+
+injuries:
+https://opticodds.readme.io/reference/get_injuries
+
+parplay:
+https://opticodds.readme.io/reference/post_parlay-odds
+
+stream:
+https://opticodds.readme.io/reference/get_stream-sport-odds
+https://opticodds.readme.io/reference/get_stream-sport-results
+
+copilot:
+https://opticodds.readme.io/reference/get_copilot-fixtures-odds
+https://opticodds.readme.io/reference/get_copilot-grader-odds
+https://opticodds.readme.io/reference/get_stream-copilot-sport-odds
+
+changelog
+https://opticodds.readme.io/changelog
+
+
+דבר נוסף כמה זמן לפני המשחק השוק יפתח מתי opticodds נותן לראות מה המשחקים שיהיהו שבוע? כמה ימים? שנה מראש? לא יודע אני גם צריך לתת זמן לשחקן להמר על התוצאה וגם יש פרמטרים שניתנים להימור בתוך המשחק עצמו כמו הזמן פציעות ועוד כל מיני דברים שהוספנו אתמול ז״א כל עוד המשחק מתקיים אנחנו מקבלים את ההימור דבר נוסף אנחנו צריים כל הזמן לבדוק מול השפן האם יש משחקים ולפתוח אותם עם זמן סביר לקבלת הימורים ולהצגתם כשוק אצלנו אז צריך להגדיר איך זה יתבצע שלא יהיה מצב שאין שווקים פתוחי אלא אם כן הליגה נגמרה או בפגרה לא
+
+
+///זה הקובץ של auto_create_sport לפני שפניתי לv0 שעבד בסדר עם שגיאות אבל לוגיקה נכונה 
+
+
+require("dotenv").config();
+const { ethers } = require("hardhat");
+const axios = require("axios");
+
+// 📌 הגדרות חיוניות
+const SPORTS_MARKET_MANAGER_ADDRESS = "0x6777767Dd2542af624b95F68D87488fB72d5AfDb"; // ✅ כתובת חוזה SportsMarketManager
+const OPTIC_ODDS_API_URL = "https://api.opticodds.com/api/v3/fixtures?sport=basketball&status=scheduled";
+const OPTIC_ODDS_API_KEY = "4cec76d7-f2a9-4977-b642-48743662d9a0"; // 🔑 API Key
+
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const INFURA_PROJECT_ID = process.env.INFURA_PROJECT_ID;
+
+async function createSportsMarkets() {
+    const provider = new ethers.JsonRpcProvider(`https://polygon-mainnet.infura.io/v3/${INFURA_PROJECT_ID}`);
+    const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+    const marketManager = new ethers.Contract(
+        SPORTS_MARKET_MANAGER_ADDRESS,
+        ["function createMarketFromOracle(string memory _name, uint256 _expirationTime, string memory gameId) public"],
+        wallet
+    );
+
+    try {
+        console.log("🔍 Fetching active sports fixtures from OpticOdds...");
+        const response = await axios.get(`${OPTIC_ODDS_API_URL}?sport=basketball&status=scheduled`, {
+            headers: { "X-Api-Key": OPTIC_ODDS_API_KEY }
+        });
+        
+        
+
+        const games = response.data.data; // ✅ הנתונים של המשחקים הקרובים
+
+        for (let game of games) {
+            const fixtureId = game.id;
+            const homeTeam = game.home_team_display;
+            const awayTeam = game.away_team_display;
+            const gameName = `${homeTeam} vs ${awayTeam}`;
+            const expirationTime = Math.floor(new Date(game.start_date).getTime() / 1000);
+
+
+
+            // 🔥 נוודא שזמן הפקיעה **לא עבר**
+            if (expirationTime < Math.floor(Date.now() / 1000)) {
+                console.log(`⏳ מדלג על משחק שפג תוקפו: ${gameName}`);
+                continue;
+            }
+
+            console.log(`⚽ Creating market: ${gameName} (Fixture ID: ${fixtureId})`);
+
+            // ✅ יצירת שוק חדש בבלוקצ'יין
+            const tx = await marketManager.createMarketFromOracle(gameName, expirationTime, fixtureId);
+            await tx.wait();
+
+            console.log(`✅ Market created for ${gameName} (ID: ${fixtureId})`);
+        }
+    } catch (error) {
+        console.error("❌ Error creating sports markets:", error.response ? error.response.data : error);
+    }
+}
+
+createSportsMarkets();
